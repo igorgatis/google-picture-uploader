@@ -44,7 +44,10 @@ class ThreadPool:
 
 
 def IsPhoto(file):
-  return file.lower().endswith('.jpg') and os.path.isfile(file)
+  if not os.path.isfile(file):
+    return False
+  _, ext = os.path.splitext(file)
+  return ext and ext.lower() in ['.jpg', '.png', '.gif']
 
 
 def TryStripPrefix(prefix, text):
