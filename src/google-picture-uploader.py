@@ -264,7 +264,7 @@ class GooglePictureUploader:
     album.remote = self.service.InsertAlbum(
         album.key,  # title
         '',         # summary
-        access=g_options.new_albums_visibility,
+        access=g_options.album_access,
         commenting_enabled='false')
 
   def SyncAlbums(self):
@@ -301,9 +301,10 @@ def main():
                     help='Google account (e.g. joe@gmail.com).')
   parser.add_option('-p', '--password', dest='password',
                     help='Google account password')
-  parser.add_option('--new_albums_visibility', default='private',
-                     help=('Visibility of newly create albums: private|public".'
-                           ' Does not change visibility of existing albums.'))
+  parser.add_option('--new_albums_visibility', dest='album_access',
+                    default='private',
+                    help=('Visibility of newly create albums: private|public".'
+                          ' Does not change visibility of existing albums.'))
   parser.add_option('--delete_albums', action='store_true', default=False,
                     help=('Whether or not keep albums which are not present'
                           ' locally.'))
@@ -313,6 +314,10 @@ def main():
   parser.add_option('--parallelism', type='int', default=5,
                     help='Number of parallel HTTP requests.')
   g_options, _ = parser.parse_args()
+
+  if g_options.album_access not in ['private', 'public']:
+    parser.error('Unknown visibility option: %s' % g_options.album_access)
+    return
 
   g_options.root = os.path.expanduser(g_options.root)
   g_options.root = os.path.abspath(g_options.root) + os.sep
