@@ -28,7 +28,6 @@ class ThreadPool:
           return
         except Exception as e:
           print e
-          tasks.put((func, args, kargs))
         finally:
           tasks.task_done()
     for i in range(num_threads):
@@ -180,6 +179,8 @@ class Album:
         self.service.Delete(photo.remote)
       photo.remote = self.service.InsertPhotoSimple(
           url, key, '', photo.path, keywords=list(photo.tags))
+    except:
+      pass
     finally:
       callback()
 
