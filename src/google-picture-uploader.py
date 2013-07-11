@@ -7,6 +7,7 @@ import itertools
 import optparse
 import os
 import os.path
+import progressbar
 import re
 import sys
 import threading
@@ -57,12 +58,18 @@ def TryStripPrefix(prefix, text):
 
 
 class Photo:
+  ERROR = 'error'
+  NONE = 'none'
+  SKIPPED = 'skip'
+  UPLOADED = 'upload'
+  ALL_STATUS = [ERROR, NONE, SKIPPED, UPLOADED]
+
   def __init__(self, key):
     self.key = key
     self.path = None
     self.remote = None
     self.checksum_tag = None
-    self.uploaded = False
+    self.status = Photo.NONE
 
   def __repr__(self):
     return 'Photo("%s", %s, %s)' % (
@@ -84,15 +91,30 @@ class Photo:
     self.checksum_tag = 'md5_%s' % md5.hexdigest()
 
 
+class Counter:
+  def __init__(self):
+    self._counter = itertools.count()
+    self._value = 0
+
+  def inc(self):
+    self._value = self._counter.next()
+    return self._value
+
+  def value(self):
+    return self._value
+
+
 class Album:
   def __init__(self, service, key):
     self.service = service
     self.key = key
     self.path = None
+    self.num_local_photos = 0
     self.remote = None
-    self.photos = {}
+    self.photos = None
+    self.photo_md5s = None
+    self.needs_update = True
     self.album_tags = frozenset(re.split('[\W\\/]+', key))
-    self.photo_md5s = frozenset()
 
   def __repr__(self):
     return 'Album("%s", %s, %s)' % (
@@ -100,48 +122,53 @@ class Album:
         ('"%s"' % self.path) if self.path else 'null',
         ('"%s"' % self.remote.title.text if self.remote else 'null'))
 
-  def GetPhotosFromGoogle(self):
-    print '  Getting list of photos from Google...',
-    sys.stdout.flush()
+  def _ScanPhotosFromDisk(self):
+    if self.photos == None:
+      self.photos = {}
+      if self.path == None:
+        return
+      for filename in os.listdir(self.path):
+        filepath = os.path.join(self.path, filename)
+        if IsPhoto(filepath):
+          key, ext = os.path.splitext(filename)
+          if key not in self.photos:
+            self.photos[key] = Photo(key)
+          photo = self.photos[key]
+          photo.path = filepath
+          photo.UpdateChecksum(self.album_tags)
+
+  def _GetPhotoMd5s(self):
+    if self.photo_md5s == None:
+      tags = set()
+      for entry in self.service.GetFeed(self.remote.GetTagsUri()).entry:
+        if entry.title and entry.title.text.startswith('md5_'):
+          tags.add(entry.title.text)
+      self.photo_md5s = frozenset(tags)
+    return self.photo_md5s
+
+  def CheckNeedUpdate(self):
+    if self.remote == None:
+      self.needs_update = True
+      return
+    self._ScanPhotosFromDisk()
+    md5s = self._GetPhotoMd5s()
+    count = 0
+    for key, photo in self.photos.iteritems():
+      if photo.path:
+        count += 1
+        if photo.checksum_tag not in md5s:
+          self.needs_update = True
+          return
+    self.needs_update = count != len(md5s)
+
+  def _GetPhotosFromGoogle(self):
     url = '/data/feed/api/user/default/albumid/%s?kind=photo' % (
         self.remote.gphoto_id.text)
-    count = 0
     for photo in self.service.GetFeed(url).entry:
       key = photo.title.text
       if key not in self.photos:
         self.photos[key] = Photo(key)
       self.photos[key].remote = photo
-      count += 1
-    print 'found %d photos.' % count
-
-  def GetImageExifDatetime(self, filepath):
-    try:
-      info = Image.open(filepath)._getexif()
-      date_format = '%Y:%m:%d %H:%M:%S'
-      epoch = datetime.datetime(1970, 1, 1)
-      for code, value in info.items():
-        if code in [306, 36867, 36868]:
-          time = datetime.datetime.strptime(value, date_format)
-          return (time - epoch).total_seconds()
-    except:
-      pass
-    return None
-
-  def ScanPhotosFromDisk(self):
-    print '  Getting list of photos from disk...',
-    sys.stdout.flush()
-    count = 0
-    for filename in os.listdir(self.path):
-      filepath = os.path.join(self.path, filename)
-      if IsPhoto(filepath):
-        count += 1
-        key, ext = os.path.splitext(filename)
-        if key not in self.photos:
-          self.photos[key] = Photo(key)
-        photo = self.photos[key]
-        photo.path = filepath
-        photo.UpdateChecksum(self.album_tags)
-    print 'found %d photos.' % count
 
   def _DeletePhoto(self, key):
     try:
@@ -153,17 +180,14 @@ class Album:
     except:
       pass
 
-  def DeletePhotos(self):
-    print '  Deleting stale photos from Google...',
-    sys.stdout.flush()
+  def _DeletePhotos(self):
     for key in list(self.photos.keys()):
       g_workers.AddTask(self._DeletePhoto, key)
     g_workers.Wait()
-    print 'done.'
 
-  def FetchTags(self):
+  def _FetchPhotoTags(self, photo):
     tags = set()
-    for entry in self.service.GetFeed(self.remote.GetTagsUri()).entry:
+    for entry in self.service.GetFeed(photo.remote.GetTagsUri()).entry:
       tags.add(entry.title.text)
     return tags
 
@@ -171,61 +195,65 @@ class Album:
     try:
       if photo.remote != None:
         if not g_options.force_update:
-          if photo.checksum_tag in self.photo_md5s:
-            photo.uploaded = True
+          if photo.checksum_tag in self._GetPhotoMd5s():
+            photo.status = Photo.SKIPPED
+            return
+          photo_tags = self._FetchPhotoTags(photo)
+          if photo.checksum_tag in photo_tags:
+            photo.status = Photo.SKIPPED
             return
         if photo.remote.GetEditLink():
           self.service.Delete(photo.remote)
-      tags = list(self.album_tags) + [photo.checksum_tag]
+      tags = sorted(list(self.album_tags) + [photo.checksum_tag])
       self.service.InsertPhotoSimple(
           url, key, '', photo.path, keywords=tags)
-      photo.uploaded = True
+      photo.status = Photo.UPLOADED
     except Exception as e:
-      photo.uploaded = False
-      print '  Failed to upload picture:', e
+      photo.status = Photo.ERROR
     finally:
-      callback()
+      callback(photo)
 
-  def UploadPhotos(self):
-    print '  Uploading photos to Google...   0%',
-    sys.stdout.flush()
+  class CountersWidget(progressbar.Widget):
+    def __init__(self, counters):
+      progressbar.Widget.__init__(self)
+      self.counters = counters
+    def update(self, pbar):
+      pairs = ['%3d:%s' % (counter.value(), name)
+               for name, counter in self.counters.iteritems()]
+      return ' '.join(pairs)
+
+  def _PrintStatusLine(self, pbar, counters):
+    total = sum([counter.value() for counter in counters.values()])
+    pbar.update(total)
+
+  def _UploadPhotos(self):
     url = '/data/feed/api/user/default/albumid/%s' %  (
         self.remote.gphoto_id.text)
-    total = len(self.photos)
-    counter = itertools.count(start=1)
-    def callback():
-      sys.stdout.write('\b\b\b\b%3d%%' % (100 * counter.next() / total))
-      sys.stdout.flush()
+    counters = dict([(name, Counter()) for name in Photo.ALL_STATUS])
+    widgets = ['Syncing [%s]' % self.key,
+               ' ', progressbar.Bar(left='[', right=']'),
+               ' ', self.CountersWidget(counters),
+               '|', progressbar.SimpleProgress(),
+               '|', progressbar.Percentage(),
+               '|', progressbar.AdaptiveETA()]
+    pbar = progressbar.ProgressBar(widgets=widgets, maxval=len(self.photos))
+    pbar.start()
+    def callback(photo):
+      counters[photo.status].inc()
+      self._PrintStatusLine(pbar, counters)
     for key, photo in self.photos.iteritems():
       g_workers.AddTask(self._UploadPhoto, url, key, photo, callback)
     g_workers.Wait()
-    print ' done.'
-
-  def NeedsUpdate(self):
-    if g_options.force_update:
-      return True
-    self.photo_md5s = frozenset([tag for tag in self.FetchTags()
-                                 if tag.startswith('md5_')])
-    if (len(self.photos) != int(self.remote.numphotos.text) or
-        len(self.photos) != len(self.photo_md5s)):
-      return True
-    for key, photo in self.photos.iteritems():
-      if photo.path and photo.checksum_tag not in self.photo_md5s:
-        return True
-    return False
+    pbar.finish()
 
   def SyncPhotos(self, service):
     if self.path == None or self.remote == None:
       return
-    print 'Syncing [%s]' % (self.key)
-    self.ScanPhotosFromDisk()
-    if not self.NeedsUpdate():
-      print '  Already up to date.'
-      return
-    self.GetPhotosFromGoogle()
+    self._ScanPhotosFromDisk()
+    self._GetPhotosFromGoogle()
     if g_options.delete_photos:
-      self.DeletePhotos()
-    self.UploadPhotos()
+      self._DeletePhotos()
+    self._UploadPhotos()
 
 
 class GooglePictureUploader:
@@ -237,7 +265,7 @@ class GooglePictureUploader:
     self.service.password = g_options.password
     self.service.ProgrammaticLogin()
 
-  def GetAlbumsFromGoogle(self):
+  def _GetAlbumsFromGoogle(self):
     print 'Getting list of albums from Google...',
     sys.stdout.flush()
     count = 0
@@ -249,20 +277,23 @@ class GooglePictureUploader:
       self.albums[key].remote = album
     print 'found %d albums.' % count
 
-  def ScanAlbumsFromDisk(self):
+  def _ScanAlbumsFromDisk(self):
     print 'Getting list of albums from disk...',
     sys.stdout.flush()
-    count = 0
+    album_count = 0
     for root, sub_folders, files in os.walk(g_options.root):
+      photo_count = 0
       for file in files:
         if IsPhoto(os.path.join(root, file)):
-          key = TryStripPrefix(g_options.root, root)
-          if key not in self.albums:
-            self.albums[key] = Album(self.service, key)
-          self.albums[key].path = root
-          count += 1
-          break
-    print 'found %d albums.' % count
+          photo_count += 1
+      if photo_count > 0:
+        album_count += 1
+        key = TryStripPrefix(g_options.root, root)
+        if key not in self.albums:
+          self.albums[key] = Album(self.service, key)
+        self.albums[key].path = root
+        self.albums[key].num_local_photos = photo_count
+    print 'found %d albums.' % album_count
 
   def _DeleteAlbum(self, key):
     album = self.albums[key]
@@ -271,7 +302,7 @@ class GooglePictureUploader:
       if album.remote.GetEditLink():
         self.service.Delete(album.remote)
 
-  def DeleteStaleAlbums(self):
+  def _DeleteStaleAlbums(self):
     print 'Deleting stale albums from Google...',
     sys.stdout.flush()
     for key in list(self.albums.keys()):
@@ -287,29 +318,45 @@ class GooglePictureUploader:
         commenting_enabled='false')
     album.remote = self.service.GetFeed(entry.GetFeedLink().href)
 
-  def SyncAlbums(self):
-    print 'Syncing albums:'
-    sys.stdout.flush()
-    sorted_albums = []
+  def _CheckAlbumNeedUpdate(self, album, callback):
+    try:
+      album.CheckNeedUpdate()
+    except Exception as e:
+      print e
+    finally:
+      callback(album)
+
+  def _SyncAlbums(self):
+    if not g_options.force_update:
+      counter = itertools.count()
+      widgets = ['Searching for album changes:',
+                 ' ', progressbar.Bar(left='[', right=']'),
+                 '|', progressbar.SimpleProgress(),
+                 '|', progressbar.Percentage(),
+                 '|', progressbar.AdaptiveETA()]
+      pbar = progressbar.ProgressBar(widgets=widgets, maxval=len(self.albums))
+      pbar.start()
+      def callback(album):
+        pbar.update(counter.next())
+      for key, album in self.albums.iteritems():
+        g_workers.AddTask(self._CheckAlbumNeedUpdate, album, callback)
+      g_workers.Wait()
+      pbar.finish()
+    print 'Syncing albums...'
     for key, album in self.albums.iteritems():
       if album.path != None and album.remote == None:
-        sorted_albums.append((0, key, album))
-      else:
-        sorted_albums.append((1, key, album))
-    sorted_albums.sort()
-    for priority, key, album in sorted_albums:
-      if album.path != None and album.remote == None:
         self._CreateAlbum(album)
-      album.SyncPhotos(self)
+      if album.needs_update:
+        album.SyncPhotos(self)
+    print 'done.'
 
   def Sync(self):
-    self.ScanAlbumsFromDisk()
-    self.GetAlbumsFromGoogle()
+    self._ScanAlbumsFromDisk()
+    self._GetAlbumsFromGoogle()
     if g_options.delete_albums:
-      self.DeleteStaleAlbums()
+      self._DeleteStaleAlbums()
     if self.albums:
-      self.SyncAlbums()
-    g_workers.Wait()
+      self._SyncAlbums()
 
 
 def main():
@@ -335,7 +382,7 @@ def main():
   parser.add_option('--delete_photos', action='store_true', default=False,
                     help=('Whether or not keep photo which are not present'
                           ' locally.'))
-  parser.add_option('--parallelism', type='int', default=5,
+  parser.add_option('--parallelism', type='int', default=3,
                     help='Number of parallel HTTP requests.')
   g_options, _ = parser.parse_args()
 
