@@ -150,6 +150,9 @@ class Album:
     if self.remote == None:
       self.needs_update = True
       return
+    if g_options.quick_check:
+      self.needs_update = self.num_local_photos != int(self.remote.numphotos)
+      return
     self._ScanPhotosFromDisk()
     md5s = self._GetPhotoMd5s()
     count = 0
@@ -218,8 +221,9 @@ class Album:
       progressbar.Widget.__init__(self)
       self.counters = counters
     def update(self, pbar):
-      pairs = ['%3d:%s' % (counter.value(), name)
-               for name, counter in self.counters.iteritems()]
+      pairs = ['%s:%d' % (name, counter.value())
+               for name, counter in self.counters.iteritems()
+               if counter.value() > 0]
       return ' '.join(pairs)
 
   def _PrintStatusLine(self, pbar, counters):
@@ -318,17 +322,16 @@ class GooglePictureUploader:
         commenting_enabled='false')
     album.remote = self.service.GetFeed(entry.GetFeedLink().href)
 
-  def _CheckAlbumNeedUpdate(self, album, callback):
+  def _CheckAlbumNeedUpdate(self, album, counter, pbar):
     try:
       album.CheckNeedUpdate()
     except Exception as e:
       print e
     finally:
-      callback(album)
+      pbar.update(counter.next())
 
   def _SyncAlbums(self):
     if not g_options.force_update:
-      counter = itertools.count()
       widgets = ['Searching for album changes:',
                  ' ', progressbar.Bar(left='[', right=']'),
                  '|', progressbar.SimpleProgress(),
@@ -336,10 +339,9 @@ class GooglePictureUploader:
                  '|', progressbar.AdaptiveETA()]
       pbar = progressbar.ProgressBar(widgets=widgets, maxval=len(self.albums))
       pbar.start()
-      def callback(album):
-        pbar.update(counter.next())
+      counter = itertools.count()
       for key, album in self.albums.iteritems():
-        g_workers.AddTask(self._CheckAlbumNeedUpdate, album, callback)
+        g_workers.AddTask(self._CheckAlbumNeedUpdate, album, counter, pbar)
       g_workers.Wait()
       pbar.finish()
     print 'Syncing albums...'
@@ -368,20 +370,25 @@ def main():
   parser.add_option('-e', '--email', dest='email',
                     help='Google account (e.g. joe@gmail.com).')
   parser.add_option('-p', '--password', dest='password',
-                    help='Google account password')
+                    help=('Google account password. If missing, password will'
+                          ' be asked at prompt time.'))
   parser.add_option('--new_albums_visibility', dest='album_access',
                     default='private',
-                    help=('Visibility of newly create albums: private|public".'
+                    help=('Visibility of newly create albums: private|public.'
                           ' Does not change visibility of existing albums.'))
+  parser.add_option('--quick_check', action='store_true', default=False,
+                    help=('Only checks number of photos per album in order to'
+                          ' tell when the album needs to be updated.'))
   parser.add_option('--force_update', action='store_true', default=False,
                     help=('Whether or not verify photo metadata individually'
-                          ' (slow and bandwidth consuming).'))
+                          ' (slow and bandwidth consuming). Use this on your'
+                          ' first run and then start using --quick_check.'))
   parser.add_option('--delete_albums', action='store_true', default=False,
                     help=('Whether or not keep albums which are not present'
-                          ' locally.'))
+                          ' locally. USE CAREFULLY!'))
   parser.add_option('--delete_photos', action='store_true', default=False,
                     help=('Whether or not keep photo which are not present'
-                          ' locally.'))
+                          ' locally. Use carefully.'))
   parser.add_option('--parallelism', type='int', default=3,
                     help='Number of parallel HTTP requests.')
   g_options, _ = parser.parse_args()
